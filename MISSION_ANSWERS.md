@@ -550,6 +550,228 @@ cp3-redis
 - **Cost guard bảo vệ tiền:** chặn khi hết ngân sách, nhưng không chặn được hàng loạt request rẻ làm quá tải server. Vì vậy cần cả hai.
 - **Authentication** xác định người gọi, nhờ đó rate limit và cost guard tính được theo từng user.
 
+## Part 5: Scaling & Reliability
+
+### Exercise 5.1: Health checks
+
+| | `/health` (liveness) | `/ready` (readiness) |
+|---|---|---|
+| Câu hỏi | Tiến trình còn sống không? | Nhận traffic được chưa? |
+| Khi lỗi | Platform restart container | Load balancer ngừng gửi request, không restart |
+| Redis chết | Vẫn 200: restart agent không cứu được Redis | 503 |
+
+**Bản develop** chỉ xem cờ `_is_ready`, không kiểm tra Redis. Log server khi gọi hai endpoint:
+
+```bash
+python app.py
+curl -i http://localhost:8000/health
+curl -i http://localhost:8000/ready
+```
+
+```text
+INFO:     127.0.0.1:48994 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:48998 - "GET /ready HTTP/1.1" 200 OK
+```
+
+**Bản production** ping Redis (`production/app.py`: `health()` dòng 165, `ready()` dòng 181). Tắt Redis rồi gọi thẳng một instance, không qua Nginx:
+
+```bash
+DC="docker compose -p k5-day14-scaling"
+$DC stop redis
+for p in health ready; do
+  docker exec k5-day14-scaling-agent-2 python -c "import http.client as h; c=h.HTTPConnection('localhost',8000); c.request('GET','/$p'); r=c.getresponse(); print('$p', r.status, r.read().decode())"
+done
+$DC start redis
+```
+
+```text
+health 200 {"status":"degraded","instance_id":"instance-f083d9","uptime_seconds":79.0,"storage":"redis","redis_connected":false}
+ready 503 {"detail":"Redis not available"}
+```
+
+### Exercise 5.2: Graceful shutdown
+
+Khi nhận SIGTERM, Uvicorn ngừng nhận kết nối mới, đợi request đang chạy xong, chạy phần shutdown của `lifespan` rồi thoát. `handle_sigterm` chỉ ghi log, và log sau cùng vì Uvicorn dùng signal handler của nó trong lúc chạy.
+
+Test: gửi hai request (mỗi request khoảng 3 giây), 0,5 giây sau gửi SIGTERM.
+
+```bash
+python app.py > ~/cp4.log 2>&1 & PID=$!
+sleep 4
+curl -s -w ' [1: %{http_code}]\n' -X POST "http://localhost:8000/ask?question=one" & C1=$!
+curl -s -w ' [2: %{http_code}]\n' -X POST "http://localhost:8000/ask?question=two" & C2=$!
+sleep 0.5; kill -TERM $PID
+wait $C1; wait $C2; wait $PID; echo "exit $?"
+cat ~/cp4.log
+```
+
+Trước khi sửa (`async def ask_agent`):
+
+```text
+{"answer":"Tôi là AI agent được deploy lên cloud. Câu hỏi của bạn đã được nhận."} [1: 200]
+{"answer":"Đây là câu trả lời từ AI agent (mock). Trong production, đây sẽ là response từ OpenAI/Anthropic."} [2: 200]
+exit 0
+2026-11-25 22:02:10,446 INFO ✅ Agent is ready!
+INFO:     Shutting down
+INFO:     127.0.0.1:48700 - "POST /ask?question=one HTTP/1.1" 200 OK
+INFO:     127.0.0.1:48706 - "POST /ask?question=two HTTP/1.1" 200 OK
+INFO:     Waiting for application shutdown.
+2026-11-25 22:02:19,830 INFO 🔄 Graceful shutdown initiated...
+2026-11-25 22:02:19,830 INFO ✅ Shutdown complete
+INFO:     Finished server process [7885]
+2026-11-25 22:02:19,830 INFO Received signal 15 — uvicorn will handle graceful shutdown
+```
+
+Sau khi sửa dòng 94 thành `def ask_agent`:
+
+```text
+{"answer":"Agent đang hoạt động tốt! (mock response) Hỏi thêm câu hỏi đi nhé."} [2: 200]
+{"answer":"Tôi là AI agent được deploy lên cloud. Câu hỏi của bạn đã được nhận."} [1: 200]
+exit 0
+2026-11-25 22:05:52,489 INFO ✅ Agent is ready!
+INFO:     Shutting down
+INFO:     Waiting for connections to close. (CTRL+C to force quit)
+INFO:     127.0.0.1:44694 - "POST /ask?question=two HTTP/1.1" 200 OK
+INFO:     127.0.0.1:44696 - "POST /ask?question=one HTTP/1.1" 200 OK
+INFO:     Waiting for application shutdown.
+2026-11-25 22:05:59,131 INFO 🔄 Graceful shutdown initiated...
+2026-11-25 22:05:59,131 INFO ✅ Shutdown complete
+INFO:     Finished server process [7951]
+2026-11-25 22:05:59,132 INFO Received signal 15 — uvicorn will handle graceful shutdown
+```
+
+(Cả hai log đã lược vài dòng khởi động và dòng kết thúc của Uvicorn.)
+
+- Cả hai lần, hai request đều xong và tiến trình thoát với mã 0.
+- Từ lúc ready đến lúc shutdown: **9,4 giây** trước, **6,6 giây** sau, chênh khoảng 2,7 giây, gần bằng một request. Điều này phù hợp với việc bản `async def` chạy hai request lần lượt, còn bản `def` chạy song song.
+- **Lý do sửa:** `time.sleep()` trong `async def` chặn event loop, nên trong lúc đó app không trả lời được cả `/health`. Với `def`, FastAPI chạy hàm trong threadpool.
+
+### Exercise 5.3: Stateless design (`production/app.py`)
+
+Bản gốc có ba vấn đề, thấy được khi đọc code:
+
+1. Không kết nối được Redis lúc khởi động thì chuyển sang lưu trong RAM (`_memory_store`). Instance đó vẫn báo ready nhưng các instance khác không thấy session của nó.
+2. History được đọc ra, sửa rồi ghi đè cả khối, nên hai request song song cùng session có thể làm mất message.
+3. `chat()` là `async def` nhưng gọi hàm chặn.
+
+Đã sửa:
+
+| Vấn đề | Cách sửa |
+|---|---|
+| State trong RAM | Bỏ hẳn `_memory_store`; mọi session nằm trong Redis, timeout 2 giây (dòng 37–38) |
+| Ghi đè history | `append_to_history()` (dòng 60–71) dùng `RPUSH`, `LTRIM` (giữ 20 message) và `EXPIRE` (1 giờ) trong một pipeline |
+| Chặn event loop | `def chat` (dòng 110) |
+| `turn` đếm dư 1 | Bỏ `+ 1`, vì history đã gồm câu hỏi hiện tại |
+
+```bash
+grep -c "USE_REDIS" production/app.py
+```
+
+```text
+0
+```
+
+**Vì sao state trong RAM hỏng khi scale:** RAM của mỗi instance là riêng, nên request sang instance khác hoặc sau khi restart sẽ mất history. Đánh đổi: Redis trở thành điểm hỏng duy nhất của stack này.
+
+### Exercise 5.4: Load balancing
+
+```bash
+touch .env.local
+DC="docker compose -p k5-day14-scaling"
+$DC up -d --build --scale agent=3
+$DC ps
+for i in {1..10}; do
+  curl -s localhost:8080/chat -X POST -H 'Content-Type: application/json' \
+    -d "{\"question\":\"Request $i\"}" \
+    | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d["served_by"], d["storage"])'
+done
+$DC logs agent | grep "POST /chat" | cut -d'|' -f1 | sort | uniq -c
+```
+
+```text
+NAME                       IMAGE                    COMMAND                  SERVICE   CREATED          STATUS                    PORTS
+k5-day14-scaling-agent-1   k5-day14-scaling-agent   "python -m uvicorn a…"   agent     30 seconds ago   Up 18 seconds (healthy)   8000/tcp
+k5-day14-scaling-agent-2   k5-day14-scaling-agent   "python -m uvicorn a…"   agent     30 seconds ago   Up 18 seconds (healthy)   8000/tcp
+k5-day14-scaling-agent-3   k5-day14-scaling-agent   "python -m uvicorn a…"   agent     30 seconds ago   Up 18 seconds (healthy)   8000/tcp
+k5-day14-scaling-nginx-1   nginx:alpine             "/docker-entrypoint.…"   nginx     30 seconds ago   Up 17 seconds             0.0.0.0:8080->80/tcp, [::]:8080->80/tcp
+k5-day14-scaling-redis-1   redis:7-alpine           "docker-entrypoint.s…"   redis     30 seconds ago   Up 29 seconds (healthy)   6379/tcp
+```
+
+```text
+instance-3c95ba redis
+instance-b46411 redis
+instance-f083d9 redis
+instance-3c95ba redis
+instance-b46411 redis
+instance-f083d9 redis
+instance-3c95ba redis
+instance-b46411 redis
+instance-f083d9 redis
+instance-3c95ba redis
+      4 agent-1  
+      3 agent-2  
+      3 agent-3  
+```
+
+Nginx chia 10 request theo round-robin: 4 / 3 / 3. Chỉ Nginx mở cổng ra ngoài (8080).
+
+### Exercise 5.5: Test stateless
+
+`python3 test_stateless.py` (lược phần câu hỏi và câu trả lời):
+
+```text
+Session ID: 892ba09a-87d1-4751-a13f-51bbd7db45d1
+
+Request 1: [instance-b46411]
+Request 2: [instance-f083d9]
+Request 3: [instance-3c95ba]
+Request 4: [instance-b46411]
+Request 5: [instance-f083d9]
+
+Total requests: 5
+Instances used: {'instance-3c95ba', 'instance-f083d9', 'instance-b46411'}
+✅ All requests served despite different instances!
+
+--- Conversation History ---
+Total messages: 10
+
+✅ Session history preserved across all instances via Redis!
+```
+
+Một session đi qua 3 instance mà vẫn đủ 10 message (5 câu hỏi, 5 câu trả lời).
+
+Script không tự tắt instance nào, nên thử thêm: tạo session, tắt `agent-1`, gửi tiếp 6 request cùng session.
+
+```bash
+S=$(curl -s localhost:8080/chat -X POST -H 'Content-Type: application/json' -d '{"question":"Before"}' \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["session_id"])')
+docker stop k5-day14-scaling-agent-1
+for i in {1..6}; do
+  curl -s -o /dev/null -w "After $i: %{http_code} %{time_total}s\n" localhost:8080/chat -X POST \
+    -H 'Content-Type: application/json' -d "{\"question\":\"After $i\",\"session_id\":\"$S\"}"
+done
+curl -s localhost:8080/chat/$S/history | python3 -c 'import sys,json; print("messages", json.load(sys.stdin)["count"])'
+```
+
+```text
+After 1: 200 0.148298s
+After 2: 200 2.047512s
+After 3: 200 0.134497s
+After 4: 200 0.138186s
+After 5: 200 0.120040s
+After 6: 200 0.116377s
+messages 14
+```
+
+- Cả 6 request trả 200 và session còn đủ 14 message (7 lượt × 2).
+- Request thứ hai mất 2,05 giây, khớp với `proxy_connect_timeout 2s` (`nginx.conf` dòng 25): Nginx thử instance đã tắt, hết 2 giây thì chuyển sang instance khác. Nếu không đặt, mặc định của Nginx là 60 giây.
+
+### Checkpoint 5
+
+- **Liveness** quyết định restart, **readiness** quyết định có gửi traffic hay không.
+- **Graceful shutdown** là ngừng nhận request mới và xử lý xong request đang chạy trước khi thoát.
+- **Stateless** là đưa state ra Redis để instance nào cũng phục vụ được, và mất một instance không mất dữ liệu.
+
 ## AI log
 
 | Phần | Hỏi gì | Nhận gì | Tự sửa / tự kiểm tra thế nào |
@@ -558,3 +780,4 @@ cp3-redis
 | Part 1 | Hướng dẫn CP1 và soạn báo cáo | Claude giải thích lệnh, soạn bản nháp phần phân tích của Part 1 (bảng anti-pattern, bảng so sánh, nhận xét) | Kiểm tra lại log trong ubuntu và đối chiếu với file .md |
 | Part 2 | Hướng dẫn CP2, lỗi cổng 80, soạn báo cáo | Claude tìm ra IIS chiếm cổng 80, đưa file override `8088:80`; chạy `docker images` để lấy kích thước hai image đã build; soạn bản nháp phần phân tích | [TỰ GHI: đã đối chiếu và sửa gì] |
 | Part 4 | Hướng dẫn CP3, soạn báo cáo | Claude chạy thử trước trên bản sao tạm, đưa lệnh curl, viết `budget_redis.py`, soạn bản nháp Part 4 từ output tôi đã chạy | [ đã đối chiếu và log] |
+| Part 5 | Hướng dẫn CP4, sửa code 5.3, soạn báo cáo | Claude chạy thử trên bản sao tạm, chỉ ra các vấn đề của code mẫu, sửa `production/app.py` và `nginx.conf`, soạn bản nháp Part 5 từ output tôi đã chạy | Tự sửa `develop/app.py` dòng 94 và chạy trước/sau; kết quả trước khi sửa khác dự đoán của Claude (cả hai request đều 200). [ đã đối chiếu và thêm log] |

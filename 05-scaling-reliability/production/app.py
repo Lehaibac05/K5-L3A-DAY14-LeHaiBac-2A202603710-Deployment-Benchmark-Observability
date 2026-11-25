@@ -31,19 +31,12 @@ from pydantic import BaseModel
 import uvicorn
 from utils.mock_llm import ask
 
-# ── Redis (optional — fallback to in-memory dict nếu không có Redis)
-try:
-    import redis
-    REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-    _redis = redis.from_url(REDIS_URL, decode_responses=True)
-    _redis.ping()
-    USE_REDIS = True
-    print("✅ Connected to Redis")
-except Exception:
-    USE_REDIS = False
-    _memory_store: dict = {}
-    print("⚠️  Redis not available — using in-memory store (not scalable!)")
+import redis
 
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+_redis = redis.from_url(
+    REDIS_URL, decode_responses=True, socket_connect_timeout=2, socket_timeout=2
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -56,44 +49,32 @@ INSTANCE_ID = os.getenv("INSTANCE_ID", f"instance-{uuid.uuid4().hex[:6]}")
 # Session Storage (Redis-backed, Stateless-compatible)
 # ──────────────────────────────────────────────────────────
 
-def save_session(session_id: str, data: dict, ttl_seconds: int = 3600):
-    """Lưu session vào Redis với TTL."""
-    serialized = json.dumps(data)
-    if USE_REDIS:
-        _redis.setex(f"session:{session_id}", ttl_seconds, serialized)
-    else:
-        _memory_store[f"session:{session_id}"] = data
+SESSION_TTL_SECONDS = 3600
+MAX_MESSAGES = 20  # 10 turns
 
 
-def load_session(session_id: str) -> dict:
-    """Load session từ Redis."""
-    if USE_REDIS:
-        data = _redis.get(f"session:{session_id}")
-        return json.loads(data) if data else {}
-    return _memory_store.get(f"session:{session_id}", {})
+def load_history(session_id: str) -> list[dict]:
+    return [json.loads(m) for m in _redis.lrange(f"session:{session_id}", 0, -1)]
 
 
 def append_to_history(session_id: str, role: str, content: str):
-    """Thêm message vào conversation history."""
-    session = load_session(session_id)
-    history = session.get("history", [])
-    history.append({
+    key = f"session:{session_id}"
+    message = json.dumps({
         "role": role,
         "content": content,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     })
-    # Giữ tối đa 20 messages (10 turns)
-    if len(history) > 20:
-        history = history[-20:]
-    session["history"] = history
-    save_session(session_id, session)
-    return history
+    # RPUSH là atomic: hai instance cùng ghi một session không đè mất message của nhau.
+    with _redis.pipeline() as p:
+        p.rpush(key, message)
+        p.ltrim(key, -MAX_MESSAGES, -1)
+        p.expire(key, SESSION_TTL_SECONDS)
+        p.execute()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info(f"Starting instance {INSTANCE_ID}")
-    logger.info(f"Storage: {'Redis ✅' if USE_REDIS else 'In-memory ⚠️'}")
     yield
     logger.info(f"Instance {INSTANCE_ID} shutting down")
 
@@ -126,7 +107,7 @@ class ChatRequest(BaseModel):
 # ──────────────────────────────────────────────────────────
 
 @app.post("/chat")
-async def chat(body: ChatRequest):
+def chat(body: ChatRequest):
     """
     Multi-turn conversation với session management.
 
@@ -140,8 +121,7 @@ async def chat(body: ChatRequest):
     append_to_history(session_id, "user", body.question)
 
     # Gọi LLM với context (trong mock, ta chỉ dùng câu hỏi hiện tại)
-    session = load_session(session_id)
-    history = session.get("history", [])
+    history = load_history(session_id)
     answer = ask(body.question)
 
     # Lưu response vào history
@@ -151,32 +131,29 @@ async def chat(body: ChatRequest):
         "session_id": session_id,
         "question": body.question,
         "answer": answer,
-        "turn": len([m for m in history if m["role"] == "user"]) + 1,
+        "turn": len([m for m in history if m["role"] == "user"]),
         "served_by": INSTANCE_ID,  # ← thấy rõ bất kỳ instance nào cũng serve được
-        "storage": "redis" if USE_REDIS else "in-memory",
+        "storage": "redis",
     }
 
 
 @app.get("/chat/{session_id}/history")
 def get_history(session_id: str):
     """Xem conversation history của một session."""
-    session = load_session(session_id)
-    if not session:
+    history = load_history(session_id)
+    if not history:
         raise HTTPException(404, f"Session {session_id} not found or expired")
     return {
         "session_id": session_id,
-        "messages": session.get("history", []),
-        "count": len(session.get("history", [])),
+        "messages": history,
+        "count": len(history),
     }
 
 
 @app.delete("/chat/{session_id}")
 def delete_session(session_id: str):
     """Xóa session (user logout)."""
-    if USE_REDIS:
-        _redis.delete(f"session:{session_id}")
-    else:
-        _memory_store.pop(f"session:{session_id}", None)
+    _redis.delete(f"session:{session_id}")
     return {"deleted": session_id}
 
 
@@ -186,32 +163,26 @@ def delete_session(session_id: str):
 
 @app.get("/health")
 def health():
-    redis_ok = False
-    if USE_REDIS:
-        try:
-            _redis.ping()
-            redis_ok = True
-        except Exception:
-            redis_ok = False
-
-    status = "ok" if (not USE_REDIS or redis_ok) else "degraded"
+    try:
+        redis_ok = _redis.ping()
+    except redis.RedisError:
+        redis_ok = False
 
     return {
-        "status": status,
+        "status": "ok" if redis_ok else "degraded",
         "instance_id": INSTANCE_ID,
         "uptime_seconds": round(time.time() - START_TIME, 1),
-        "storage": "redis" if USE_REDIS else "in-memory",
-        "redis_connected": redis_ok if USE_REDIS else "N/A",
+        "storage": "redis",
+        "redis_connected": redis_ok,
     }
 
 
 @app.get("/ready")
 def ready():
-    if USE_REDIS:
-        try:
-            _redis.ping()
-        except Exception:
-            raise HTTPException(503, "Redis not available")
+    try:
+        _redis.ping()
+    except redis.RedisError:
+        raise HTTPException(503, "Redis not available")
     return {"ready": True, "instance": INSTANCE_ID}
 
 

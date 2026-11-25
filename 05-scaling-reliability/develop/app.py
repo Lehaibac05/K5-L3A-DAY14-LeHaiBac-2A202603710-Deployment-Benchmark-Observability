@@ -91,7 +91,7 @@ def root():
 
 
 @app.post("/ask")
-async def ask_agent(question: str):
+def ask_agent(question: str):
     if not _is_ready:
         raise HTTPException(503, "Agent not ready")
     return {"answer": ask(question)}
