@@ -92,59 +92,85 @@ Nguồn: `reports/eval_v1.json`, `reports/eval_v2.json`, `reports/eval_v2_fixed.
 
 ### 4.1 Screenshot
 
-- [ ] Dashboard Grafana khi đang có tải (thấy rõ Golden Signals)
-- [ ] Một trace chậm trong Jaeger (thấy span nào chiếm thời gian)
-- [ ] Một trace lỗi trong Jaeger (có event `exception`)
-- [ ] Trang Alerts của Prometheus với ít nhất 1 alert đang **firing**
+- [Dashboard Grafana](screenshots/grafana-dashboard.png)
+- [Trace chậm trong Jaeger](screenshots/jaeger-slow-trace.png)
+- [Trace lỗi trong Jaeger](screenshots/jaeger-error-trace.png)
+- [Prometheus Alerts: 3 alert đang firing](screenshots/prometheus-alert-firing.png)
+
+Số từ Prometheus khi chạy 3 instance, 100 users (23:36:35):
+
+1. **avg 285 ms, p95 747 ms.** p95 gấp 2,6 lần avg: một phần nhỏ request chậm bị avg che mất.
+2. **Nginx chia đều:** 18,05 / 18,22 / 18,06 req/s cho 3 instance.
+3. **Input 3968, output 2108 tokens/s:** input gồm system prompt, tài liệu retrieval và câu hỏi, còn output chỉ là câu trả lời.
+4. `curl localhost:8080/metrics` trả **404:** Nginx chặn từ bên ngoài, Prometheus scrape trực tiếp trong mạng nội bộ.
 
 ### 4.2 Thí nghiệm "phá hệ thống"
 
+A và B được làm **cùng lúc** (3 instance, 30 users). Mốc 0 là 23:37:39, ngay sau khi lệnh `up` xong; log ghi khoảng 5 giây một lần.
+
 | # | Thay đổi | Alert nào firing | Thời gian từ lúc đổi → firing | Panel nào phản ánh rõ nhất |
 |---|---|---|---|---|
-| A | `MOCK_ERROR_RATE=0.2` | | | |
-| B | `MOCK_SLOW_RATE=0.3` | | | |
-| C | `LLM_MODEL=mock-llm-large` | | | |
-| D | `docker pause` 1 instance | | | |
-| E | `AGENT_VERSION=v1` | | | |
+| A | `MOCK_ERROR_RATE=0.2` | `AgentHighErrorRate` | khoảng 88 giây (pending từ giây 25) | Error rate |
+| B | `MOCK_SLOW_RATE=0.3` | `AgentHighLatencyP95` | khoảng 141 giây (pending từ giây 25) | p95 latency |
+| C | `LLM_MODEL=mock-llm-large` | Không làm | | |
+| D | `docker pause` 1 instance | Không làm | | |
+| E | `AGENT_VERSION=v1` | Không làm | | |
+
+- B firing sau A vì `for` là 2 phút, còn A là 1 phút.
+- `LLMCostBurnRateHigh` đã firing từ giây 0, trước khi A và B có tác dụng: do tải 100 users của bài scale, không phải do thí nghiệm. Rule dùng cửa sổ 5 phút nên còn kéo dài.
+- `AgentInstanceDown` chỉ `pending` thoáng qua khi container được tạo lại, không firing.
 
 **Thí nghiệm E không làm alert nào firing. Bạn sẽ phát hiện loại sự cố này trong production bằng cách nào?**
 
-...
+Metric hạ tầng không biết câu trả lời đúng hay sai. Cần chạy eval trên golden dataset trước mỗi lần deploy (quality gate ở mục 3) và định kỳ trên bản đang chạy, theo dõi retrieval hit ratio và phản hồi của người dùng.
 
 ### 4.3 Debug bằng trace
 
-Chọn 1 trace chậm nhất bạn tìm được:
+Trace chậm, lấy khi `MOCK_SLOW_RATE=0.3`:
 
-- `trace_id`: ...
-- Tổng thời gian: ... ms
-- Span chiếm nhiều thời gian nhất: ... (... ms, ...%)
+- `trace_id`: `7eebbbd644efe5b0b947bff91edb215f`
+- Tổng thời gian: 1784,8 ms
+- Span chiếm nhiều thời gian nhất: `chat mock-llm-small` (1637,0 ms, 92%); `agent.retrieve_context` 84,3 ms
 - Dòng log tương ứng (grep theo `trace_id`):
 
 ```json
+{"ts": "2026-11-25T16:41:56.580237+00:00", "level": "INFO", "service": "observable-agent", "instance": "7ffe4c990c53", "event": "llm_call", "trace_id": "7eebbbd644efe5b0b947bff91edb215f", "span_id": "841b1af79787abb6", "request_id": "c26c7fe14c2a", "model": "mock-llm-small", "agent_version": "v2", "input_tokens": 37, "output_tokens": 20, "cost_usd": 1.8e-05, "llm_ms": 1633.5}
+{"ts": "2026-11-25T16:41:56.581318+00:00", "level": "INFO", "service": "observable-agent", "instance": "7ffe4c990c53", "event": "http_request", "trace_id": "7eebbbd644efe5b0b947bff91edb215f", "span_id": "841b1af79787abb6", "request_id": "c26c7fe14c2a", "method": "POST", "route": "/ask", "status": 200, "ms": 1783.2}
+```
 
+Trace lỗi (`0f1c979d091a5ec1d64c5a84463542a7`):
+
+```json
+{"ts": "2026-11-25T16:42:13.734025+00:00", "level": "INFO", "service": "observable-agent", "instance": "7ffe4c990c53", "event": "llm_error", "trace_id": "0f1c979d091a5ec1d64c5a84463542a7", "span_id": "dfb70c7bdb3fe648", "request_id": "6483fb31bd9a", "error": "Upstream LLM error: 503 Service Unavailable (mock)"}
 ```
 
 ---
 
 ## 5. Benchmark scaling (production, Locust headless, 100 users, 2 phút)
 
+Dòng `/ask` trong `benchmark-results/scale_1_stats.csv` và `scale_3_stats.csv`:
+
 | Số instance | RPS | p50 (ms) | p95 (ms) | p99 (ms) | Failures |
 |---|---|---|---|---|---|
-| 1 | | | | | |
-| 3 | | | | | |
+| 1 | 57,6 | 240 | 1700 | 2200 | 62 / 6203 (1,00%) |
+| 3 | 56,8 | 210 | 980 | 2000 | 64 / 6762 (0,95%) |
 
 **Giải thích kết quả:** Scale có cải thiện p95 không? Nút thắt nằm ở đâu?
 
-...
+- **p95 giảm 42%** (1700 → 980 ms), p50 giảm 12%, p99 chỉ giảm 9%.
+- Với 1 instance, LLM p95 chỉ khoảng 198 ms trong khi HTTP p95 khoảng 1,3 giây (Prometheus, 90 giây). Phần chênh nằm ngoài LLM: có thể là request xếp hàng trong instance bị giới hạn 0,5 CPU. Tôi chưa đo CPU để xác nhận.
+- **p99 gần như không đổi** vì phần đuôi chủ yếu đến từ 3% request chậm 1,5 giây của mock LLM; thêm instance không sửa được.
+- **RPS không tăng** (57,6 và 56,8): 100 users nghỉ 0,5–2 giây giữa các lần gọi, nên tải bị giới hạn bởi số user. Lượt 3 instance gửi nhiều request hơn (6762 so với 6203) nhưng RPS trong CSV không cao hơn, nên không dùng RPS để kết luận.
+- Failures gần bằng nhau, khớp mức lỗi 1% của mock.
 
 ---
 
 ## 6. Kết luận
 
 - 3 điều bạn học được về benchmark & observability:
-  1. ...
-  2. ...
-  3. ...
-- Nếu đưa agent này lên production thật, bạn sẽ thêm metric / alert nào nữa?
+  1. Trung bình che mất request chậm: 3% request chậm làm p99 tăng 7,4 lần trong khi avg chỉ tăng 18%.
+  2. Scale chỉ giúp phần chậm do xếp hàng: p95 giảm 42%, còn p99 gần như giữ nguyên vì do LLM.
+  3. Nhanh và không lỗi chưa phải là đúng: v1 chỉ đúng 1/23 câu, chỉ eval mới phát hiện được.
+- Nếu đưa agent này lên production thật, bạn sẽ thêm metric / alert nào nữa? Alert p99, lỗi 5xx đo ở Nginx, CPU của từng instance, retrieval hit ratio giảm, và điểm eval định kỳ.
 
-...
+**Sửa code mẫu:** `production/Dockerfile` thiếu `ENV PYTHONUSERBASE=/home/agent/.local` nên container crash (`No module named 'uvicorn'`); đã thêm dòng này. Cổng 8089 bị Windows chiếm nên chạy Locust headless.
