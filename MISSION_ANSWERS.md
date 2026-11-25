@@ -334,6 +334,78 @@ curl: (7) Failed to connect to localhost port 8000 after 17 ms: Couldn't connect
 - **Compose** khai báo các service, network, volume và thứ tự khởi động trong một file.
 - **Debug container:** `docker logs` xem log, `docker exec` chạy lệnh bên trong container đang chạy.
 
+## Part 3: Cloud Deployment
+
+### Exercise 3.1: Railway
+
+Deploy agent Part 6 (`06-lab-complete/`), kèm Redis trên Railway.
+
+- URL: https://agent-production-8f74b50f.up.railway.app
+- Chi tiết: [DEPLOYMENT.md](DEPLOYMENT.md)
+
+```bash
+BASE=https://agent-production-8f74b50f.up.railway.app   # AGENT_API_KEY lấy từ biến môi trường
+curl -sS -o /dev/null -w '%{http_code}
+' "$BASE/health"
+curl -sS -o /dev/null -w '%{http_code}
+' "$BASE/ready"
+curl -sS -o /dev/null -w '%{http_code}
+' -X POST "$BASE/ask" -H 'Content-Type: application/json' -d '{"question":"Hello"}'
+curl -sS -o /dev/null -w '%{http_code}
+' -X POST "$BASE/ask" -H 'Content-Type: application/json' -H "X-API-Key: $AGENT_API_KEY" -d '{"question":"Hello"}'
+```
+
+```text
+200
+200
+401
+200
+```
+
+Lần lượt là `/health`, `/ready`, `/ask` không có key và `/ask` có key.
+
+- [Dashboard](screenshots/dashboard.png)
+- [Service đang chạy](screenshots/running.png)
+- [Kết quả test](screenshots/test.png)
+
+**Lỗi gặp phải:** log của lần deploy đầu ghi `environment="development"`. Kiểm tra thì service chưa có biến nào trong 5 biến cần đặt. Đặt lại biến rồi deploy lại.
+
+### Exercise 3.2: So sánh `railway.toml` và `render.yaml`
+
+So sánh hai file mẫu trong `03-cloud-deployment/`:
+
+| | `railway.toml` | `render.yaml` |
+|---|---|---|
+| Phạm vi | Build và deploy của một service | Cả hạ tầng: web service và Redis |
+| Build | `NIXPACKS` tự nhận ngôn ngữ, không ghi lệnh build | Ghi rõ `runtime: python` và `buildCommand` |
+| Biến môi trường | Không khai báo, đặt qua dashboard hoặc CLI | Khai báo trong `envVars`; secret dùng `sync: false` (nhập tay) hoặc `generateValue: true` (tự sinh) |
+| Redis | Không khai báo, thêm riêng | Khai báo trong cùng file |
+| Region, plan | Không có | `singapore`, `free` |
+| Restart khi crash | `ON_FAILURE`, tối đa 3 lần | Không khai báo |
+| Auto deploy | Không khai báo | `autoDeploy: true` |
+| Health check | `healthcheckPath = "/health"`, timeout 30 giây | `healthCheckPath: /health` |
+
+**Vì sao khác:** `railway.toml` chỉ cấu hình một lần deploy, phần còn lại nằm ở project trên Railway. `render.yaml` là Blueprint, mô tả cả hệ thống để dựng lại từ một file.
+
+`06-lab-complete/railway.toml` dùng `DOCKERFILE` thay `NIXPACKS`. Theo [tài liệu Railway](https://docs.railway.com/config-as-code), `railway.toml` đã bị ngừng hỗ trợ: service mới không dùng được và file ngừng được đọc từ 2026-12-01.
+
+### Exercise 3.3: Cloud Run
+
+`cloudbuild.yaml` chạy 4 bước nối tiếp nhau bằng `waitFor`, bước trước lỗi thì dừng:
+
+1. **test:** cài thư viện và chạy `pytest`.
+2. **build:** build image với hai tag, `$COMMIT_SHA` và `latest`, dùng image `latest` cũ làm cache.
+3. **push:** đẩy image lên Container Registry.
+4. **deploy:** triển khai đúng image `$COMMIT_SHA` lên Cloud Run (`asia-southeast1`, 1–10 instance), secret lấy từ Secret Manager.
+
+`service.yaml` khai báo service Cloud Run: scale, CPU/RAM, biến môi trường, liveness probe gọi `/health`, startup probe gọi `/ready`.
+
+### Checkpoint 3
+
+- Deploy được lên Railway và có URL public.
+- Đặt biến bằng `railway variable set`; key truyền qua `--stdin` để không nằm trong lệnh.
+- Xem log bằng `railway logs --service agent`.
+
 ## Part 4: API Security
 
 Trong các lệnh dưới đây: `B=http://localhost:8000`, `J='Content-Type: application/json'`, `D='{"question":"Hello"}'`. Key, mật khẩu và token đã che.
@@ -876,6 +948,7 @@ k5-day14-final-redis-1   redis:7-alpine         "docker-entrypoint.s…"   redis
 | CP0 | Docker không chạy trong WSL | Claude chỉ ra chưa bật WSL integration và cách bật | Bật tích hợp, Docker chạy được trong Ubuntu |
 | Part 1 | Hướng dẫn CP1 và soạn báo cáo | Claude giải thích lệnh, soạn bản nháp phần phân tích của Part 1 (bảng anti-pattern, bảng so sánh, nhận xét) | Kiểm tra lại log trong ubuntu và đối chiếu với file .md |
 | Part 2 | Hướng dẫn CP2, lỗi cổng 80, soạn báo cáo | Claude tìm ra IIS chiếm cổng 80, đưa file override `8088:80`; chạy `docker images` để lấy kích thước hai image đã build; soạn bản nháp phần phân tích | [TỰ GHI: đã đối chiếu và sửa gì] |
+| Part 3 | Hướng dẫn CP6 (Railway), soạn báo cáo | Claude đưa lệnh Railway CLI, chẩn đoán lỗi thiếu biến môi trường từ log, soạn bản nháp Part 3 và `DEPLOYMENT.md` từ output tôi đã chạy | Tự deploy và chạy 4 lệnh kiểm tra. [TỰ GHI: đã đối chiếu và sửa gì] |
 | Part 4 | Hướng dẫn CP3, soạn báo cáo | Claude chạy thử trước trên bản sao tạm, đưa lệnh curl, viết `budget_redis.py`, soạn bản nháp Part 4 từ output tôi đã chạy | [ đã đối chiếu và log] |
 | Part 5 | Hướng dẫn CP4, sửa code 5.3, soạn báo cáo | Claude chạy thử trên bản sao tạm, chỉ ra các vấn đề của code mẫu, sửa `production/app.py` và `nginx.conf`, soạn bản nháp Part 5 từ output tôi đã chạy | Tự sửa `develop/app.py` dòng 94 và chạy trước/sau; kết quả trước khi sửa khác dự đoán của Claude (cả hai request đều 200). [ đã đối chiếu và thêm log] |
 | Part 6 | Hướng dẫn CP5, ghi code vào repo, soạn báo cáo | Claude viết code cho các TODO (11 file trong `06-lab-complete/`), chạy script chấm trên bản sao, soạn bản nháp Part 6 từ output tôi đã chạy | Tự chạy script chấm trong WSL: PASS 12/12. [ đã đọc, kiểm tra, sửa log] |
