@@ -334,6 +334,222 @@ curl: (7) Failed to connect to localhost port 8000 after 17 ms: Couldn't connect
 - **Compose** khai báo các service, network, volume và thứ tự khởi động trong một file.
 - **Debug container:** `docker logs` xem log, `docker exec` chạy lệnh bên trong container đang chạy.
 
+## Part 4: API Security
+
+Trong các lệnh dưới đây: `B=http://localhost:8000`, `J='Content-Type: application/json'`, `D='{"question":"Hello"}'`. Key, mật khẩu và token đã che.
+
+### Exercise 4.1: API key (`04-api-gateway/develop/app.py`)
+
+- **Key được kiểm tra ở đâu:** `verify_api_key()` (dòng 39), gắn vào `/ask` bằng `Depends` (dòng 70). `/` và `/health` là public.
+- **Sai key:** trả 403; thiếu key trả 401.
+- **Rotate key:** đổi biến `AGENT_API_KEY` rồi restart, vì key chỉ đọc một lần lúc khởi động (dòng 35). App chỉ nhận một key nên key cũ mất hiệu lực ngay; muốn không gián đoạn thì phải tạm chấp nhận cả hai key.
+- **Điểm yếu:** có key mặc định trong code (dòng 35), in key ra log (dòng 91–92), so sánh bằng `!=` (dòng 49) thay vì `secrets.compare_digest`.
+
+```bash
+AGENT_API_KEY=*** python app.py
+curl -i $B/ask -X POST -H "$J" -d "$D"
+curl -i $B/ask -X POST -H "$J" -H "X-API-Key: wrong" -d "$D"
+curl -i $B/ask -X POST -H "$J" -H "X-API-Key: ***" -d "$D"
+```
+
+Thiếu key:
+
+```text
+HTTP/1.1 401 Unauthorized
+date: Wed, 25 Nov 2026 14:41:17 GMT
+server: uvicorn
+content-length: 67
+content-type: application/json
+
+{"detail":"Missing API key. Include header: X-API-Key: <your-key>"}
+```
+
+Sai key:
+
+```text
+HTTP/1.1 403 Forbidden
+date: Wed, 25 Nov 2026 14:41:17 GMT
+server: uvicorn
+content-length: 29
+content-type: application/json
+
+{"detail":"Invalid API key."}
+```
+
+Đúng key (dòng cuối bị terminal cắt):
+
+```text
+HTTP/1.1 200 OK
+date: Wed, 25 Nov 2026 14:41:17 GMT
+server: uvicorn
+content-length: 122
+content-type: application/json
+
+{"question":"Hello","answer":"Tôi là AI agent được deploy lên cloud. Câu hỏi của bạ…} 
+```
+
+### Exercise 4.2: JWT (`04-api-gateway/production/auth.py`)
+
+1. Client gửi username/password tới `POST /auth/token`; `authenticate_user()` (dòng 70–75) kiểm tra.
+2. `create_token()` (dòng 35–43) ký token HS256 chứa `sub`, `role`, `iat`, `exp` (60 phút).
+3. Client gửi `Authorization: Bearer <token>`; `verify_token()` (dòng 46–67) kiểm tra chữ ký và hạn, không cần tra database. Thiếu hoặc hết hạn trả 401, token sai trả 403.
+
+JWT được ký chứ không mã hóa: ai có token cũng đọc được payload, nên không được để secret trong đó.
+
+```bash
+JWT_SECRET=$(openssl rand -hex 32) python app.py
+curl -i $B/ask -X POST -H "$J" -d "$D"
+TOKEN=$(curl -s $B/auth/token -X POST -H "$J" \
+  -d '{"username":"student","password":"***"}' \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["access_token"])')
+curl -i $B/ask -X POST -H "Authorization: Bearer $TOKEN" -H "$J" -d '{"question":"Explain JWT"}'
+```
+
+Không có token:
+
+```text
+HTTP/1.1 401 Unauthorized
+date: Wed, 25 Nov 2026 14:42:21 GMT
+server: uvicorn
+www-authenticate: Bearer
+content-length: 76
+content-type: application/json
+x-content-type-options: nosniff
+x-frame-options: DENY
+x-xss-protection: 1; mode=block
+referrer-policy: strict-origin-when-cross-origin
+
+{"detail":"Authentication required. Include: Authorization: Bearer <token>"}
+```
+
+Có token:
+
+```text
+HTTP/1.1 200 OK
+date: Wed, 25 Nov 2026 14:42:21 GMT
+server: uvicorn
+content-length: 215
+content-type: application/json
+x-content-type-options: nosniff
+x-frame-options: DENY
+x-xss-protection: 1; mode=block
+referrer-policy: strict-origin-when-cross-origin
+
+{"question":"Explain JWT","answer":"Đây là câu trả lời từ AI agent (mock). Trong production, đây sẽ là response từ OpenAI/Anthropic.","usage":{"requests_remaining":9,"budget_remaining_usd":2.1e-05}}
+```
+
+### Exercise 4.3: Rate limiting (`rate_limiter.py`)
+
+- **Thuật toán:** sliding window. Mỗi user có một `deque` timestamp; bỏ các timestamp cũ hơn 60 giây rồi đếm phần còn lại (dòng 38–45).
+- **Limit:** 10 request/phút cho user (dòng 86).
+- **Admin:** không bỏ qua hoàn toàn mà dùng limiter 100 request/phút (dòng 87), chọn theo `role` ở `app.py` dòng 141.
+- **Hạn chế:** lưu trong RAM nên mất khi restart; chạy nhiều instance thì mỗi instance đếm riêng.
+
+```bash
+for i in {1..20}; do
+  curl -s -o /dev/null -w "Request $i: %{http_code}\n" $B/ask -X POST \
+    -H "Authorization: Bearer $TOKEN" -H "$J" -d "{\"question\":\"Test $i\"}"
+done
+curl -i $B/ask -X POST -H "Authorization: Bearer $TOKEN" -H "$J" -d "$D"
+```
+
+```text
+Request 1: 200
+Request 2: 200
+Request 3: 200
+Request 4: 200
+Request 5: 200
+Request 6: 200
+Request 7: 200
+Request 8: 200
+Request 9: 200
+Request 10: 200
+Request 11: 429
+Request 12: 429
+Request 13: 429
+Request 14: 429
+Request 15: 429
+Request 16: 429
+Request 17: 429
+Request 18: 429
+Request 19: 429
+Request 20: 429
+```
+
+Lệnh `curl -i` ngay sau vòng lặp (dòng cuối bị terminal cắt):
+
+```text
+HTTP/1.1 429 Too Many Requests
+date: Wed, 25 Nov 2026 14:43:47 GMT
+server: uvicorn
+x-ratelimit-limit: 10
+x-ratelimit-remaining: 0
+x-ratelimit-reset: 1795617888
+retry-after: 59
+content-length: 98
+content-type: application/json
+x-content-type-options: nosniff
+x-frame-options: DENY
+x-xss-protection: 1; mode=block
+referrer-policy: strict-origin-when-cross-origin
+
+{"detail":{"error":"Rate limit exceeded","limit":10,"window_seconds":60,"retry_afte…}}
+```
+
+### Exercise 4.4: Cost guard
+
+`cost_guard.py` có sẵn giới hạn $1/ngày mỗi user (402) và $10/ngày toàn hệ thống (503), lưu trong RAM. Bài yêu cầu $10/tháng mỗi user, lưu trong Redis: `04-api-gateway/production/budget_redis.py`.
+
+```python
+def check_budget(user_id: str, estimated_cost: float) -> bool:
+    if not 0 <= estimated_cost < float("inf"):
+        raise ValueError("estimated_cost must be finite and non-negative")
+    key = f"budget:{user_id}:{datetime.now(timezone.utc):%Y-%m}"
+    # Cộng trước rồi mới so sánh: hai request song song không thể cùng lọt qua.
+    with r.pipeline() as p:
+        p.incrbyfloat(key, estimated_cost)
+        p.expire(key, 32 * 24 * 3600)
+        total = p.execute()[0]
+    if total > MONTHLY_BUDGET_USD:
+        r.incrbyfloat(key, -estimated_cost)  # hoàn lại vì request bị chặn
+        return False
+    return True
+```
+
+- **Reset đầu tháng:** key chứa năm-tháng (UTC), sang tháng mới là key mới. TTL 32 ngày chỉ để dọn key cũ.
+- **Chạy song song:** nếu đọc số dư rồi mới cộng, hai request cùng lúc có thể cùng lọt qua. Ở đây cộng trước bằng `INCRBYFLOAT` (atomic), vượt thì hoàn lại.
+- **Đánh đổi:** khoản đang chờ hoàn có thể làm một request song song bị từ chối oan.
+- **Giới hạn:** hàm chạy độc lập, chưa nối vào `app.py`; chi phí là số ước tính.
+
+```bash
+docker run -d --rm --name cp3-redis -p 6379:6379 redis:7-alpine
+python budget_redis.py
+docker stop cp3-redis
+```
+
+```text
+(.venv) haibac@LeHaiBac:~/day14/04-api-gateway/production$ cd ~/day14 && source .venv/bin/activate && cd 04-api-gateway/production
+cp /mnt/c/Users/ADMIN/OneDrive/M*t*nh/LLM/Lab_day14/K5-L3A-DAY14-*/04-api-gateway/production/budget_redis.py .
+docker run -d --rm --name cp3-redis -p 6379:6379 redis:7-alpine
+sleep 2
+python budget_redis.py
+docker stop cp3-redis
+1a316575cdb6f407dbcff990c2e0c504b84b51bafca60e638b6e83d19b693490
+[(6, True), (3, True), (2, False), (1, True)] spent = 10.0 ttl = 2764800
+cp3-redis
+```
+
+**Vấn đề có sẵn trong code mẫu:**
+
+1. `app.py` dòng 160 gán `budget_remaining_usd` bằng `usage.total_cost_usd`, tức số tiền đã dùng. Output ở 4.2 cho thấy `2.1e-05` ngay sau request đầu tiên, trong khi ngân sách còn gần $1.
+2. `cost_guard.py`: `_global_cost` chỉ cộng dồn (dòng 104), không reset sang ngày mới; `_global_today` (dòng 50) không được dùng. Chạm $10 thì trả 503 tới khi restart.
+
+### Checkpoint 4
+
+- **Rate limit bảo vệ tốc độ:** chặn gọi dồn dập, nhưng không chặn được vài request rất đắt.
+- **Cost guard bảo vệ tiền:** chặn khi hết ngân sách, nhưng không chặn được hàng loạt request rẻ làm quá tải server. Vì vậy cần cả hai.
+- **Authentication** xác định người gọi, nhờ đó rate limit và cost guard tính được theo từng user.
+
 ## AI log
 
 | Phần | Hỏi gì | Nhận gì | Tự sửa / tự kiểm tra thế nào |
@@ -341,3 +557,4 @@ curl: (7) Failed to connect to localhost port 8000 after 17 ms: Couldn't connect
 | CP0 | Docker không chạy trong WSL | Claude chỉ ra chưa bật WSL integration và cách bật | Bật tích hợp, Docker chạy được trong Ubuntu |
 | Part 1 | Hướng dẫn CP1 và soạn báo cáo | Claude giải thích lệnh, soạn bản nháp phần phân tích của Part 1 (bảng anti-pattern, bảng so sánh, nhận xét) | Kiểm tra lại log trong ubuntu và đối chiếu với file .md |
 | Part 2 | Hướng dẫn CP2, lỗi cổng 80, soạn báo cáo | Claude tìm ra IIS chiếm cổng 80, đưa file override `8088:80`; chạy `docker images` để lấy kích thước hai image đã build; soạn bản nháp phần phân tích | [TỰ GHI: đã đối chiếu và sửa gì] |
+| Part 4 | Hướng dẫn CP3, soạn báo cáo | Claude chạy thử trước trên bản sao tạm, đưa lệnh curl, viết `budget_redis.py`, soạn bản nháp Part 4 từ output tôi đã chạy | [ đã đối chiếu và log] |
