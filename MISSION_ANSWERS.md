@@ -26,7 +26,7 @@ curl -i -X POST "http://localhost:8000/ask?question=Hello"
 ```
 
 ```text
-[DÁN OUTPUT]
+INFO:     127.0.0.1:57712 - "POST /ask?question=Hello HTTP/1.1" 200 OK
 ```
 
 Gọi health check, endpoint này không tồn tại trong bản develop:
@@ -36,13 +36,15 @@ curl -i http://localhost:8000/health
 ```
 
 ```text
-[DÁN OUTPUT]
+INFO:     127.0.0.1:56170 - "GET /health HTTP/1.1" 404 Not Found
 ```
 
 Log server khi xử lý `/ask`:
 
 ```text
-[DÁN CÁC DÒNG [DEBUG]]
+[DEBUG] Got question: Hello
+[DEBUG] Using key: sk-hardcoded-fake-key-never-do-this
+[DEBUG] Response: Đây là câu trả lời từ AI agent (mock). Trong production, đây sẽ là response từ OpenAI/Anthropic.
 ```
 
 **Nhận xét:** agent trả lời được nhưng chưa production-ready. Dòng 34 ghi API key vào log và app không có `/health`.
@@ -68,19 +70,29 @@ curl -i -X POST http://localhost:8000/ask -H "Content-Type: application/json" -d
 ```
 
 ```text
-[DÁN OUTPUT 4 LỆNH]
+INFO:     127.0.0.1:58840 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:43094 - "GET /ready HTTP/1.1" 200 OK
+{"time":"2026-11-25 17:08:46,311","level":"INFO","msg":"{"event": "agent_request", "question_length": 5, "client_ip": "127.0.0.1"}"}
+{"time":"2026-11-25 17:08:46,442","level":"INFO","msg":"{"event": "agent_response", "response_length": 96}"}
+INFO:     127.0.0.1:42048 - "POST /ask HTTP/1.1" 200 OK
+INFO:     127.0.0.1:44486 - "POST /ask HTTP/1.1" 422 Unprocessable Entity
 ```
 
 Log khi nhấn Ctrl+C:
 
 ```text
-[DÁN LOG SHUTDOWN]
+INFO:     Waiting for application shutdown.
+{"time":"2026-11-25 17:11:09,515","level":"INFO","msg":"Agent shutting down gracefully — finishing in-flight requests..."}
+{"time":"2026-11-25 17:11:09,616","level":"INFO","msg":"Shutdown complete"}
+INFO:     Application shutdown complete.
+INFO:     Finished server process [3547]
 ```
 
 Đổi cổng bằng biến môi trường, không sửa code (`PORT=9000 python app.py`):
 
 ```text
-[DÁN OUTPUT curl -i http://localhost:9000/health]
+INFO:     Uvicorn running on http://0.0.0.0:9000 (Press CTRL+C to quit)
+INFO:     127.0.0.1:42282 - "GET /health HTTP/1.1" 200 OK
 ```
 
 | Feature | Develop | Production | Tại sao quan trọng? |
