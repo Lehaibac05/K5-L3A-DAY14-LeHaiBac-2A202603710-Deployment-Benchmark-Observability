@@ -772,6 +772,103 @@ messages 14
 - **Graceful shutdown** là ngừng nhận request mới và xử lý xong request đang chạy trước khi thoát.
 - **Stateless** là đưa state ra Redis để instance nào cũng phục vụ được, và mất một instance không mất dữ liệu.
 
+## Part 6: Final Project
+
+Code nằm trong `06-lab-complete/`. Chạy script chấm trong WSL Ubuntu, có Docker:
+
+```bash
+python check_production_ready.py
+```
+
+```text
+  📋 Checklist Deliverable
+     ✅ Dockerfile (multi-stage, < 500 MB)
+     ✅ docker-compose.yml (agent + redis)
+     ✅ .dockerignore
+     ✅ Health check endpoint (GET /health)
+     ✅ Readiness endpoint (GET /ready)
+     ✅ API Key authentication
+     ✅ Rate limiting
+     ✅ Cost guard
+     ✅ Config từ environment variables
+     ✅ Structured logging
+     ✅ Graceful shutdown
+     ✅ Public URL ready (Railway / Render config)
+----------------------------------------------------------------
+  Result: 12/12 tiêu chí đạt · 41/41 checks passed
+  🎉 PASS 12/12 — PRODUCTION READY! Deploy nào!
+```
+
+Kết quả đo trong cùng lần chạy:
+
+| Kiểm tra | Kết quả |
+|---|---|
+| Docker image | 238 MB, build 23 giây |
+| Rate limit (`RATE_LIMIT_PER_MINUTE=5`) | 429 sau 5 request thành công; restart agent vẫn 429 |
+| Cost guard (ngân sách 0,000001 USD) | 402 ở request thứ 1 |
+| Log | 12 dòng, đều là JSON hợp lệ |
+| SIGTERM khi đang có request | request vẫn 200, exit code 0 |
+| `docker stop` | exit code 0, 1,0 giây |
+
+Cost guard chặn ngay request thứ 1 vì các lượt test trước dùng chung Redis và đã cộng chi phí vào cùng ngày.
+
+### Thử tay với Docker Compose
+
+```bash
+echo "AGENT_API_KEY=dev-key" > .env
+docker compose -p k5-day14-final up -d --build
+docker compose -p k5-day14-final ps
+ask() { curl -s -w ' [%{http_code}]
+' -X POST localhost:8000/ask -H 'Content-Type: application/json' "$@"; }
+curl -s -w ' [%{http_code}]
+' localhost:8000/ready
+ask -d '{"question":"Hello"}'
+ask -H 'X-API-Key: dev-key' -d '{"question":"What is docker?"}'
+ask -H 'X-API-Key: dev-key' -d '{"question":"   "}'
+docker compose -p k5-day14-final stop redis
+curl -s -w ' [%{http_code}]
+' localhost:8000/health
+curl -s -w ' [%{http_code}]
+' localhost:8000/ready
+docker compose -p k5-day14-final down -v
+```
+
+```text
+NAME                     IMAGE                  COMMAND                  SERVICE   CREATED          STATUS                    PORTS
+k5-day14-final-agent-1   k5-day14-final-agent   "sh -c 'exec uvicorn…"   agent     16 seconds ago   Up 10 seconds (healthy)   0.0.0.0:8000->8000/tcp, [::]:8000->8000/tcp
+k5-day14-final-redis-1   redis:7-alpine         "docker-entrypoint.s…"   redis     16 seconds ago   Up 16 seconds (healthy)   6379/tcp
+{"status":"ready"} [200]
+{"detail":"Invalid or missing API key"} [401]
+{"question":"What is docker?","answer":"Container là cách đóng gói app để chạy ở mọi nơi. Build once, run anywhere!","cost_usd":1.1999999999999999e-05} [200]
+{"detail":[{"type":"string_too_short","loc":["body","question"],"msg":"String should have at least 1 character","input":"   ","ctx":{"min_length":1}}]} [422]
+{"status":"ok"} [200]
+{"detail":"Redis not available"} [503]
+```
+
+(Đã lược log build và các dòng trạng thái của Compose.) Hai dòng cuối là sau khi tắt Redis.
+
+### Cách làm
+
+| Phần | Cách làm và lý do |
+|---|---|
+| `POST /ask` | Thứ tự: API key → rate limit → ngân sách → LLM → ghi chi phí. Dùng `def` để lời gọi chặn chạy trong threadpool |
+| `auth.py` | So sánh bằng `compare_digest`. Chưa đặt `AGENT_API_KEY` thì từ chối tất cả |
+| `rate_limiter.py` | Sorted set trong Redis, `ZADD` trước rồi `ZCARD` trong một `MULTI/EXEC`, nên hai request song song không thể cùng lọt qua. Key được băm SHA-256 |
+| `cost_guard.py` | Cộng chi phí bằng `INCRBYFLOAT` vào key theo ngày (UTC), sang ngày mới là key mới |
+| Lỗi input | Pydantic trả 422 khi câu hỏi rỗng, toàn khoảng trắng hoặc quá 2000 ký tự. Lỗi Redis trả 503, không lộ stack trace |
+| Shutdown | Uvicorn xử lý SIGTERM, `lifespan` đóng Redis. `exec` trong `CMD` để uvicorn là PID 1 và nhận được tín hiệu |
+
+**Vì sao Redis chết mà `/health` vẫn 200 còn `/ready` là 503:** `/health` quyết định restart, mà restart agent không cứu được Redis. `/ready` quyết định nhận traffic, và agent thiếu Redis thì không kiểm tra được rate limit và ngân sách.
+
+**Vì sao state phải ở Redis:** container chạy 2 worker, mỗi worker có RAM riêng. Đếm trong RAM thì giới hạn bị nhân đôi và mất khi restart.
+
+**Giới hạn:**
+
+- Chi phí được ghi sau khi gọi LLM, nên nhiều request song song có thể vượt ngân sách một chút.
+- Token được ước tính theo số ký tự (4 ký tự một token).
+- Ngân sách tính chung cho cả agent, không tách theo user.
+- Redis là điểm hỏng duy nhất: mất Redis thì `/ask` trả 503.
+
 ## AI log
 
 | Phần | Hỏi gì | Nhận gì | Tự sửa / tự kiểm tra thế nào |
@@ -781,3 +878,4 @@ messages 14
 | Part 2 | Hướng dẫn CP2, lỗi cổng 80, soạn báo cáo | Claude tìm ra IIS chiếm cổng 80, đưa file override `8088:80`; chạy `docker images` để lấy kích thước hai image đã build; soạn bản nháp phần phân tích | [TỰ GHI: đã đối chiếu và sửa gì] |
 | Part 4 | Hướng dẫn CP3, soạn báo cáo | Claude chạy thử trước trên bản sao tạm, đưa lệnh curl, viết `budget_redis.py`, soạn bản nháp Part 4 từ output tôi đã chạy | [ đã đối chiếu và log] |
 | Part 5 | Hướng dẫn CP4, sửa code 5.3, soạn báo cáo | Claude chạy thử trên bản sao tạm, chỉ ra các vấn đề của code mẫu, sửa `production/app.py` và `nginx.conf`, soạn bản nháp Part 5 từ output tôi đã chạy | Tự sửa `develop/app.py` dòng 94 và chạy trước/sau; kết quả trước khi sửa khác dự đoán của Claude (cả hai request đều 200). [ đã đối chiếu và thêm log] |
+| Part 6 | Hướng dẫn CP5, ghi code vào repo, soạn báo cáo | Claude viết code cho các TODO (11 file trong `06-lab-complete/`), chạy script chấm trên bản sao, soạn bản nháp Part 6 từ output tôi đã chạy | Tự chạy script chấm trong WSL: PASS 12/12. [ đã đọc, kiểm tra, sửa log] |
